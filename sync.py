@@ -14,17 +14,15 @@ from langchain.schema import Document
 import logging
 import pandas as pd
 
-# Qdrant imports with fallback
+# Qdrant imports - using the same pattern as your working debug script
 try:
-    from langchain_qdrant import QdrantVectorStore
     from qdrant_client import QdrantClient
+    from langchain_qdrant import QdrantVectorStore
     from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
     QDRANT_AVAILABLE = True
 except ImportError:
-    from langchain_community.vectorstores import QdrantVectorStore
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
-    QDRANT_AVAILABLE = True
+    print("❌ Qdrant imports failed. Please install: pip install qdrant-client langchain-qdrant")
+    QDRANT_AVAILABLE = False
 
 # DOCX support
 try:
@@ -39,10 +37,15 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 KB_PATH = "C:/Users/maria selciya/Desktop/chatbotKB_test"
-QDRANT_PATH = "./qdrant_storage"
 SQLITE_PATH = "./file_index.db"
 COLLECTION_NAME = "kb_collection"
 SUPPORTED_EXTENSIONS = {'.pdf', '.txt', '.csv', '.docx', '.md', '.py', '.js', '.html', '.xml', '.json'}
+
+# Validate KB_PATH exists
+if not os.path.exists(KB_PATH):
+    print(f"❌ ERROR: KB_PATH does not exist: {KB_PATH}")
+    print(f"Please create the directory or update KB_PATH in the script")
+    exit(1)
 
 class KnowledgeBaseSync:
     def __init__(self):
@@ -55,28 +58,57 @@ class KnowledgeBaseSync:
     def initialize(self):
         """Initialize all components"""
         load_dotenv()
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment")
         
-        # Initialize embeddings
+        # Check required environment variables
+        required_vars = ['QDRANT_URL', 'QDRANT_API_KEY', 'GOOGLE_API_KEY']
+        missing_vars = []
+        
+        for var in required_vars:
+            if not os.getenv(var):
+                missing_vars.append(var)
+        
+        if missing_vars:
+            raise ValueError(f"Missing environment variables: {missing_vars}")
+        
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        
+        print(f"🔌 Connecting to Qdrant Cloud: {qdrant_url}")
+        
+        # Initialize Qdrant CLOUD client - same as your working debug script
+        self.client = QdrantClient(
+            url=qdrant_url,
+            api_key=qdrant_api_key,
+        )
+        
+        # Initialize embeddings - same as your working debug script
         self.embedding_model = GoogleGenerativeAIEmbeddings(
             model="models/embedding-001",
             google_api_key=google_api_key
         )
         
-        # Initialize Qdrant
-        Path(QDRANT_PATH).mkdir(exist_ok=True)
-        self.client = QdrantClient(path=QDRANT_PATH)
-        
+        # Test connection and get/create collection
         try:
-            self.client.get_collection(COLLECTION_NAME)
-        except Exception:
-            self.client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=768, distance=Distance.COSINE)
-            )
+            collections = self.client.get_collections()
+            collection_names = [col.name for col in collections.collections]
+            
+            if COLLECTION_NAME in collection_names:
+                collection_info = self.client.get_collection(COLLECTION_NAME)
+                logger.info(f"✅ Connected to existing collection '{COLLECTION_NAME}' - Points: {collection_info.points_count}")
+            else:
+                logger.info(f"📁 Creating new collection: {COLLECTION_NAME}")
+                self.client.create_collection(
+                    collection_name=COLLECTION_NAME,
+                    vectors_config=VectorParams(size=768, distance=Distance.COSINE)
+                )
+                logger.info("✅ Collection created successfully!")
+                
+        except Exception as e:
+            logger.error(f"❌ Qdrant connection failed: {e}")
+            raise
         
+        # Initialize vectorstore - same pattern as debug script
         self.vectorstore = QdrantVectorStore(
             client=self.client,
             collection_name=COLLECTION_NAME,
@@ -85,7 +117,7 @@ class KnowledgeBaseSync:
         
         # Initialize database with migration
         self.init_database()
-        logger.info("✅ All components initialized")
+        logger.info("✅ All components initialized for CLOUD sync")
     
     def check_column_exists(self, table_name, column_name):
         """Check if a column exists in a table"""
@@ -174,15 +206,28 @@ class KnowledgeBaseSync:
                     docs = [Document(page_content=content, metadata={'source': str(file_path)})]
             
             elif ext == '.csv':
-                df = pd.read_csv(file_path)
-                if not df.empty:
-                    content = f"CSV: {file_path.name}\nColumns: {', '.join(df.columns)}\nRows: {len(df)}\n\n{df.to_string(max_rows=100)}"
-                    docs = [Document(page_content=content, metadata={'source': str(file_path)})]
+                try:
+                    df = pd.read_csv(file_path)
+                    if not df.empty:
+                        content = f"CSV: {file_path.name}\nColumns: {', '.join(df.columns)}\nRows: {len(df)}\n\n{df.to_string(max_rows=100)}"
+                        docs = [Document(page_content=content, metadata={'source': str(file_path)})]
+                except Exception as e:
+                    logger.error(f"Failed to load CSV {file_path}: {e}")
+                    return []
             
             elif ext in ['.txt', '.md', '.py', '.js', '.html', '.xml', '.json']:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                if content.strip():
+                encodings = ['utf-8', 'latin-1', 'cp1252']
+                content = None
+                
+                for encoding in encodings:
+                    try:
+                        with open(file_path, 'r', encoding=encoding) as f:
+                            content = f.read()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                
+                if content and content.strip():
                     docs = [Document(page_content=content, metadata={'source': str(file_path)})]
             
             # Add metadata
@@ -200,16 +245,28 @@ class KnowledgeBaseSync:
             return []
     
     def remove_from_vectorstore(self, filename):
-        """Remove all vectors for a specific file"""
+        """Remove all vectors for a specific file using Qdrant client directly"""
         try:
-            # Delete points with matching filename
-            self.client.delete(
+            # Use scroll to find points with the filename
+            scroll_result = self.client.scroll(
                 collection_name=COLLECTION_NAME,
-                points_selector=Filter(
-                    must=[FieldCondition(key="filename", match=MatchValue(value=filename))]
-                )
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="metadata.filename", match=MatchValue(value=filename))]
+                ),
+                limit=10000  # Get all points for this file
             )
-            logger.info(f"🗑️ Removed vectors for: {filename}")
+            
+            point_ids = [point.id for point in scroll_result[0]]
+            
+            if point_ids:
+                self.client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=point_ids
+                )
+                logger.info(f"🗑️ Removed {len(point_ids)} vectors for: {filename}")
+            else:
+                logger.info(f"ℹ️ No vectors found for: {filename}")
+            
             return True
         except Exception as e:
             logger.error(f"Failed to remove vectors for {filename}: {e}")
@@ -219,6 +276,7 @@ class KnowledgeBaseSync:
         """Add file to vector store"""
         try:
             filename = file_path.name
+            print(f"🔄 PROCESSING: {filename}")
             
             # Remove existing vectors first
             self.remove_from_vectorstore(filename)
@@ -236,13 +294,32 @@ class KnowledgeBaseSync:
                 doc_chunks = splitter.split_documents([doc])
                 chunks.extend(doc_chunks)
             
-            # Add filename to all chunks
-            for chunk in chunks:
+            if not chunks:
+                logger.warning(f"No chunks created for {filename}")
+                return False
+            
+            # Add filename and chunk_id to all chunks
+            for i, chunk in enumerate(chunks):
                 chunk.metadata['filename'] = filename
                 chunk.metadata['chunk_id'] = str(uuid.uuid4())
+                chunk.metadata['chunk_index'] = i
             
-            # Add to vectorstore
-            self.vectorstore.add_documents(chunks)
+            # Add to vectorstore in batches to avoid timeout
+            batch_size = 50
+            total_added = 0
+            
+            for i in range(0, len(chunks), batch_size):
+                batch = chunks[i:i + batch_size]
+                try:
+                    ids = self.vectorstore.add_documents(batch)
+                    total_added += len(batch)
+                    print(f"   📦 Batch {i//batch_size + 1}: Added {len(batch)} chunks")
+                except Exception as e:
+                    logger.error(f"Failed to add batch {i//batch_size + 1}: {e}")
+                    # Continue with next batch
+            
+            if total_added == 0:
+                return False
             
             # Update database
             file_stats = file_path.stat()
@@ -253,14 +330,16 @@ class KnowledgeBaseSync:
                 (filename, filepath, file_type, file_size, mtime, hash, chunk_count, indexed_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, (filename, str(file_path), file_path.suffix.lower(), 
-                  file_stats.st_size, file_stats.st_mtime, file_hash, len(chunks)))
+                  file_stats.st_size, file_stats.st_mtime, file_hash, total_added))
             self.conn.commit()
             
-            logger.info(f"✅ Added {filename}: {len(chunks)} chunks")
+            print(f"✅ ADDED: {filename} ({total_added} chunks)")
             return True
             
         except Exception as e:
             logger.error(f"Failed to add {file_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def remove_file(self, filename):
@@ -350,10 +429,29 @@ class KnowledgeBaseSync:
         self.conn.commit()
         logger.info("✅ Database rebuilt")
     
+    def test_search(self):
+        """Test search functionality"""
+        try:
+            print("\n🔍 Testing search functionality...")
+            results = self.vectorstore.similarity_search("test query", k=1)
+            if results:
+                print(f"✅ Search working! Found {len(results)} results")
+                print(f"📄 Sample: {results[0].page_content[:100]}...")
+            else:
+                print("ℹ️ No results found (collection might be empty)")
+            return True
+        except Exception as e:
+            print(f"❌ Search test failed: {e}")
+            return False
+    
     def sync(self, force_rebuild=False):
         """Main sync function - optimized for real-time updates"""
         try:
             logger.info("🚀 Starting knowledge base sync...")
+            
+            if not QDRANT_AVAILABLE:
+                print("❌ Qdrant not available. Please install required packages.")
+                return False
             
             if not self.client:
                 self.initialize()
@@ -367,6 +465,11 @@ class KnowledgeBaseSync:
             db_files = self.get_database_files()
             
             print(f"📂 Found {len(current_files)} supported files in directory")
+            
+            if len(current_files) == 0:
+                print(f"⚠️ No supported files found in {KB_PATH}")
+                print(f"Supported extensions: {SUPPORTED_EXTENSIONS}")
+                return False
             
             # Find changes
             to_add = []
@@ -398,13 +501,15 @@ class KnowledgeBaseSync:
             
             # Add/update files
             for file_path in to_add:
-                print(f"🔄 PROCESSING: {file_path.name}")
                 if self.add_to_vectorstore(file_path):
                     added_count += 1
-                    print(f"✅ ADDED: {file_path.name}")
                 else:
                     failed_count += 1
                     print(f"❌ FAILED: {file_path.name}")
+            
+            # Test search if we have data
+            if added_count > 0 or len(db_files) > 0:
+                self.test_search()
             
             # Show final state
             self.print_current_files()
@@ -415,16 +520,22 @@ class KnowledgeBaseSync:
             print(f"🗑️ Removed: {len(to_remove)}")
             print(f"❌ Failed: {failed_count}")
             
+            if added_count == 0 and len(to_remove) == 0:
+                print("ℹ️ No changes detected - database is up to date")
+            
             return True
             
         except Exception as e:
             logger.error(f"Sync failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def cleanup(self):
         """Clean up resources"""
         if self.conn:
             self.conn.close()
+
 
 # Main execution functions
 def sync_kb(force_rebuild=False):
@@ -444,13 +555,33 @@ def list_files():
     finally:
         syncer.cleanup()
 
+def test_connection():
+    """Test Qdrant cloud connection"""
+    syncer = KnowledgeBaseSync()
+    try:
+        syncer.initialize()
+        print("✅ Connection test successful!")
+        syncer.test_search()
+        return True
+    except Exception as e:
+        print(f"❌ Connection test failed: {e}")
+        return False
+    finally:
+        syncer.cleanup()
+
 # CLI interface
 if __name__ == "__main__":
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "--rebuild":
+        print("🔄 Running with --rebuild flag (will recreate database)")
         sync_kb(force_rebuild=True)
     elif len(sys.argv) > 1 and sys.argv[1] == "--list":
+        print("📋 Listing current files in database")
         list_files()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test":
+        print("🔍 Testing connection")
+        test_connection()
     else:
+        print("🚀 Running normal sync")
         sync_kb()

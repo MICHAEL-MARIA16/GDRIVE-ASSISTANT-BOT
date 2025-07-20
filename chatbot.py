@@ -19,6 +19,14 @@ import pandas as pd
 import hashlib
 import warnings
 import atexit
+import json
+from contextlib import contextmanager
+from filelock import FileLock
+
+# Load environment variables
+load_dotenv()
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -37,13 +45,13 @@ except ImportError:
     DOCX_AVAILABLE = False
     logger.warning("⚠️ DOCX support not available - install python-docx")
 
-# For Qdrant support - ONLY Qdrant
+# For Qdrant support - ONLY Qdrant Cloud
 try:
     from langchain_qdrant import QdrantVectorStore
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, VectorParams
     QDRANT_AVAILABLE = True
-    logger.info("✅ Using modern QdrantVectorStore")
+    logger.info("✅ Using modern QdrantVectorStore for cloud")
 except ImportError:
     try:
         # Try the community package version
@@ -58,7 +66,6 @@ except ImportError:
 
 # === Configuration ===
 KB_PATH = "C:/Users/maria selciya/Desktop/chatbotKB_test"
-QDRANT_PATH = "./qdrant_storage"
 SQLITE_PATH = "./file_index.db"
 COLLECTION_NAME = "kb_collection"
 SYNC_INTERVAL = 120  # 2 minutes in seconds as requested
@@ -66,13 +73,145 @@ SYNC_INTERVAL = 120  # 2 minutes in seconds as requested
 # Supported file types
 SUPPORTED_EXTENSIONS = {'.pdf', '.txt', '.csv', '.docx', '.md', '.py', '.js', '.html', '.xml', '.json'}
 
-# Global variables for auto-sync
+# Global variables for auto-sync and connection management
 sync_thread = None
 stop_sync = threading.Event()
 chatbot_needs_reload = threading.Event()
 qdrant_client = None  # Global client to avoid conflicts
-sync_lock = threading.Lock()  # Add lock to prevent concurrent syncs
+sync_lock = threading.Lock()  # Prevent concurrent syncs
+qdrant_lock = threading.RLock()  # Reentrant lock for Qdrant operations
+connection_pool_lock = threading.Lock()  # For connection pool management
 
+# Connection pool settings
+MAX_CONNECTIONS = 3
+connection_pool = []
+active_connections = 0
+
+# File locks for process coordination
+QDRANT_LOCK_FILE = "./qdrant_operations.lock"
+SYNC_LOCK_FILE = "./sync_operations.lock"
+
+def validate_environment():
+    """Validate required environment variables"""
+    missing_vars = []
+    
+    if not QDRANT_URL:
+        missing_vars.append("QDRANT_URL")
+    
+    if not QDRANT_API_KEY:
+        missing_vars.append("QDRANT_API_KEY")
+    
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if not google_api_key:
+        missing_vars.append("GOOGLE_API_KEY")
+    
+    if missing_vars:
+        logger.error("❌ Missing required environment variables:")
+        for var in missing_vars:
+            logger.error(f"   - {var}")
+        logger.error("   Please add these to your .env file")
+        return False
+    
+    logger.info("✅ All required environment variables found")
+    return True
+
+@contextmanager
+def qdrant_operation_lock():
+    """Context manager for Qdrant operations with file locking"""
+    lock = FileLock(QDRANT_LOCK_FILE)
+    try:
+        with lock.acquire(timeout=30):
+            with qdrant_lock:
+                yield
+    except Exception as e:
+        logger.error(f"❌ Failed to acquire Qdrant operation lock: {e}")
+        raise
+
+@contextmanager
+def sync_operation_lock():
+    """Context manager for sync operations with file locking"""
+    lock = FileLock(SYNC_LOCK_FILE)
+    try:
+        with lock.acquire(timeout=60):
+            with sync_lock:
+                yield
+    except Exception as e:
+        logger.error(f"❌ Failed to acquire sync operation lock: {e}")
+        raise
+
+class QdrantConnectionManager:
+    """Manage Qdrant connections with connection pooling and proper cleanup"""
+    
+    def __init__(self, max_connections=3):
+        self.max_connections = max_connections
+        self.connections = []
+        self.active_count = 0
+        self.lock = threading.Lock()
+        
+    def get_connection(self):
+        """Get a connection from the pool or create a new one"""
+        with self.lock:
+            # Try to reuse existing connection
+            if self.connections:
+                client = self.connections.pop()
+                try:
+                    # Test connection
+                    client.get_collections()
+                    self.active_count += 1
+                    return client
+                except Exception as e:
+                    logger.warning(f"⚠️ Reused connection failed, creating new one: {e}")
+            
+            # Create new connection if under limit
+            if self.active_count < self.max_connections:
+                try:
+                    client = QdrantClient(
+                        url=QDRANT_URL,
+                        api_key=QDRANT_API_KEY,
+                        timeout=30
+                    )
+                    # Test the connection
+                    client.get_collections()
+                    self.active_count += 1
+                    logger.info(f"✅ Created new Qdrant connection ({self.active_count}/{self.max_connections})")
+                    return client
+                except Exception as e:
+                    logger.error(f"❌ Failed to create Qdrant connection: {e}")
+                    raise
+            else:
+                raise Exception("Maximum number of Qdrant connections reached")
+    
+    def return_connection(self, client):
+        """Return a connection to the pool"""
+        with self.lock:
+            if client and self.active_count > 0:
+                try:
+                    # Test connection before returning to pool
+                    client.get_collections()
+                    self.connections.append(client)
+                    self.active_count -= 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Connection test failed, not returning to pool: {e}")
+                    self.active_count = max(0, self.active_count - 1)
+                    try:
+                        client.close()
+                    except:
+                        pass
+    
+    def close_all(self):
+        """Close all connections"""
+        with self.lock:
+            for client in self.connections:
+                try:
+                    client.close()
+                except:
+                    pass
+            self.connections.clear()
+            self.active_count = 0
+            logger.info("✅ All Qdrant connections closed")
+
+# Global connection manager
+connection_manager = QdrantConnectionManager(MAX_CONNECTIONS)
 
 # === Database Schema Management ===
 def init_database():
@@ -181,11 +320,19 @@ def check_dependencies():
         missing_deps.append("python-docx")
         logger.warning("⚠️ DOCX support not available")
     
+    # Check for filelock
+    try:
+        import filelock
+        logger.info("✅ Filelock available for process coordination")
+    except ImportError:
+        missing_deps.append("filelock")
+        logger.warning("⚠️ filelock not available - install with: pip install filelock")
+    
     if missing_deps:
         logger.warning("⚠️ Missing dependencies:")
         for dep in missing_deps:
             logger.warning(f"   - {dep}")
-        logger.warning("   Install with: pip install python-docx langchain-qdrant qdrant-client")
+        logger.warning("   Install with: pip install python-docx langchain-qdrant qdrant-client filelock")
     
     return QDRANT_AVAILABLE
 
@@ -264,106 +411,81 @@ def check_for_changes():
         return False
 
 def run_sync_process():
-    """Run sync process with proper Qdrant client cleanup"""
+    """Run sync process with proper Qdrant connection management"""
     try:
-        # Close main Qdrant client temporarily to allow sync access
-        global qdrant_client
-        if qdrant_client:
-            try:
-                qdrant_client.close()
-                qdrant_client = None
-                logger.info("🔄 Closed main Qdrant client for sync")
-                time.sleep(1)  # Give it a moment to fully close
-            except Exception as e:
-                logger.warning(f"⚠️ Error closing Qdrant client: {e}")
-        
-        # Get the current script directory
-        current_dir = Path(__file__).parent
-        sync_script = current_dir / "sync.py"
-        
-        if not sync_script.exists():
-            logger.error(f"❌ sync.py not found at {sync_script}")
-            return False
-        
-        logger.info("🔄 Starting background sync process...")
-        
-        # Run sync.py with proper environment and error handling
-        env = os.environ.copy()
-        python_executable = sys.executable
-        
-        result = subprocess.run(
-            [python_executable, str(sync_script)], 
-            cwd=current_dir,
-            capture_output=True, 
-            text=True, 
-            encoding='utf-8',
-            errors='replace',
-            timeout=900,  # 15 minutes timeout
-            env=env
-        )
-        
-        # Wait a moment after sync completes
-        time.sleep(2)
-        
-        # Recreate Qdrant client
-        try:
-            qdrant_client = QdrantClient(path=QDRANT_PATH)
-            logger.info("🔄 Reconnected to Qdrant after sync")
-        except Exception as e:
-            logger.error(f"❌ Failed to reconnect to Qdrant: {e}")
-        
-        # Log the output for debugging
-        if result.stdout:
-            logger.info("📋 Sync output:")
-            for line in result.stdout.strip().split('\n'):
-                if line.strip():
-                    logger.info(f"   {line}")
-        
-        if result.stderr:
-            # Filter out the specific Qdrant access error since we handle it
-            error_lines = result.stderr.strip().split('\n')
-            filtered_errors = []
-            for line in error_lines:
-                if ("already accessed by another instance" not in line and 
-                    "Storage folder" not in line):
-                    filtered_errors.append(line)
+        with sync_operation_lock():
+            logger.info("🔄 Starting sync process with file lock...")
             
-            if filtered_errors:
-                logger.warning("⚠️ Sync warnings/errors:")
-                for line in filtered_errors:
+            # Get the current script directory
+            current_dir = Path(__file__).parent
+            sync_script = current_dir / "sync.py"
+            
+            if not sync_script.exists():
+                logger.error(f"❌ sync.py not found at {sync_script}")
+                return False
+            
+            logger.info("🔄 Starting background sync process...")
+            
+            # Run sync.py with proper environment and error handling
+            env = os.environ.copy()
+            # Pass connection info to sync script
+            env['QDRANT_CLOUD_MODE'] = 'true'
+            python_executable = sys.executable
+            
+            result = subprocess.run(
+                [python_executable, str(sync_script)], 
+                cwd=current_dir,
+                capture_output=True, 
+                text=True, 
+                encoding='utf-8',
+                errors='replace',
+                timeout=900,  # 15 minutes timeout
+                env=env
+            )
+            
+            # Wait a moment after sync completes
+            time.sleep(2)
+            
+            # Log the output for debugging
+            if result.stdout:
+                logger.info("📋 Sync output:")
+                for line in result.stdout.strip().split('\n'):
                     if line.strip():
-                        logger.warning(f"   {line}")
-        
-        success = result.returncode == 0
-        if success:
-            logger.info("✅ Background sync completed successfully!")
-        else:
-            logger.error(f"❌ Background sync failed with return code: {result.returncode}")
-        
-        return success
+                        logger.info(f"   {line}")
             
+            if result.stderr:
+                # Filter out harmless warnings
+                error_lines = result.stderr.strip().split('\n')
+                filtered_errors = []
+                for line in error_lines:
+                    if ("already accessed by another instance" not in line and 
+                        "Storage folder" not in line and
+                        "UserWarning" not in line):
+                        filtered_errors.append(line)
+                
+                if filtered_errors:
+                    logger.warning("⚠️ Sync warnings/errors:")
+                    for line in filtered_errors:
+                        if line.strip():
+                            logger.warning(f"   {line}")
+            
+            success = result.returncode == 0
+            if success:
+                logger.info("✅ Background sync completed successfully!")
+            else:
+                logger.error(f"❌ Background sync failed with return code: {result.returncode}")
+            
+            return success
+                
     except subprocess.TimeoutExpired:
         logger.error("❌ Background sync timed out!")
-        # Ensure we reconnect even after timeout
-        try:
-            if not qdrant_client:
-                qdrant_client = QdrantClient(path=QDRANT_PATH)
-        except Exception:
-            pass
         return False
     except FileNotFoundError:
         logger.error(f"❌ sync.py not found or Python executable not found")
         return False
     except Exception as e:
         logger.error(f"❌ Background sync error: {e}")
-        # Ensure we reconnect even after error
-        try:
-            if not qdrant_client:
-                qdrant_client = QdrantClient(path=QDRANT_PATH)
-        except Exception:
-            pass
         return False
-
 
 def background_sync():
     """Background thread function that runs sync periodically"""
@@ -375,44 +497,27 @@ def background_sync():
             if stop_sync.wait(timeout=SYNC_INTERVAL):
                 break  # Stop was signaled
             
-            # Use lock to prevent concurrent syncs
-            if sync_lock.acquire(blocking=False):
-                try:
-                    logger.info("🔍 Checking for knowledge base changes...")
-                    
-                    # Check for changes first
-                    if check_for_changes():
-                        logger.info("📝 Changes detected! Running background sync...")
-                        print(f"\n🔄 [AUTO-SYNC] Changes detected - syncing knowledge base...")
-                        
-                        # Run the sync process with proper client management
-                        if run_sync_process():
-                            logger.info("✅ Background sync completed successfully!")
-                            print("✅ [AUTO-SYNC] Knowledge base updated successfully!")
-                            chatbot_needs_reload.set()  # Signal that chatbot needs to reload
-                        else:
-                            logger.error("❌ Background sync failed!")
-                            print("❌ [AUTO-SYNC] Sync failed - continuing with current knowledge base")
-                    else:
-                        logger.debug("ℹ️ No changes detected in knowledge base")
-                        
-                finally:
-                    sync_lock.release()
+            logger.info("🔍 Checking for knowledge base changes...")
+            
+            # Check for changes first
+            if check_for_changes():
+                logger.info("📝 Changes detected! Running background sync...")
+                print(f"\n🔄 [AUTO-SYNC] Changes detected - syncing knowledge base...")
+                
+                # Run the sync process with proper locking
+                if run_sync_process():
+                    logger.info("✅ Background sync completed successfully!")
+                    print("✅ [AUTO-SYNC] Knowledge base updated successfully!")
+                    chatbot_needs_reload.set()  # Signal that chatbot needs to reload
+                else:
+                    logger.error("❌ Background sync failed!")
+                    print("❌ [AUTO-SYNC] Sync failed - continuing with current knowledge base")
             else:
-                logger.debug("⏭️ Sync already in progress, skipping this cycle")
+                logger.debug("ℹ️ No changes detected in knowledge base")
                 
         except Exception as e:
             logger.error(f"❌ Background sync thread error: {e}")
-            # Try to reconnect Qdrant client if needed
-            try:
-                global qdrant_client
-                if not qdrant_client:
-                    qdrant_client = QdrantClient(path=QDRANT_PATH)
-                    logger.info("🔄 Reconnected Qdrant client after error")
-            except Exception:
-                pass
             time.sleep(30)  # Wait before retrying
-
 
 def start_background_sync():
     """Start the background sync thread"""
@@ -434,25 +539,27 @@ def stop_background_sync():
 
 def cleanup_resources():
     """Clean up resources on exit"""
-    global qdrant_client
     try:
         logger.info("🧹 Cleaning up resources...")
         stop_background_sync()
         
-        if qdrant_client:
+        # Close all Qdrant connections
+        connection_manager.close_all()
+        
+        # Clean up lock files
+        for lock_file in [QDRANT_LOCK_FILE, SYNC_LOCK_FILE]:
             try:
-                qdrant_client.close()
-                qdrant_client = None
-                logger.info("✅ Qdrant client closed")
+                if os.path.exists(lock_file):
+                    os.remove(lock_file)
             except Exception as e:
-                logger.warning(f"⚠️ Error closing Qdrant client: {e}")
-                
+                logger.warning(f"⚠️ Error removing lock file {lock_file}: {e}")
+        
         # Small delay to ensure cleanup is complete
         time.sleep(1)
+        logger.info("✅ Cleanup completed")
         
     except Exception as e:
         logger.error(f"❌ Error during cleanup: {e}")
-
 
 def check_sync_status():
     """Check if sync is needed before starting chatbot"""
@@ -479,55 +586,42 @@ def check_sync_status():
 def create_qdrant_collection_if_not_exists(client, collection_name, vector_size=768):
     """Create Qdrant collection if it doesn't exist"""
     try:
-        # Check if collection exists
-        collections = client.get_collections()
-        collection_names = [col.name for col in collections.collections]
-        
-        if collection_name not in collection_names:
-            logger.info(f"📁 Creating new Qdrant collection: {collection_name}")
-            client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=vector_size,
-                    distance=Distance.COSINE
+        with qdrant_operation_lock():
+            # Check if collection exists
+            collections = client.get_collections()
+            collection_names = [col.name for col in collections.collections]
+            
+            if collection_name not in collection_names:
+                logger.info(f"📁 Creating new Qdrant collection: {collection_name}")
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(
+                        size=vector_size,
+                        distance=Distance.COSINE
+                    )
                 )
-            )
-            logger.info("✅ Qdrant collection created successfully!")
-        else:
-            logger.info(f"✅ Qdrant collection '{collection_name}' already exists")
-        
-        return True
+                logger.info("✅ Qdrant collection created successfully!")
+            else:
+                logger.info(f"✅ Qdrant collection '{collection_name}' already exists")
+            
+            return True
     except Exception as e:
         logger.error(f"❌ Failed to create/check Qdrant collection: {e}")
         return False
 
-def get_single_qdrant_client():
-    """Get or create a single Qdrant client instance"""
-    global qdrant_client
-    if qdrant_client is None:
-        try:
-            qdrant_client = QdrantClient(path=QDRANT_PATH)
-            logger.info("✅ Connected to Qdrant database")
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Qdrant: {e}")
-            return None
-    return qdrant_client
-
 def load_existing_vector_store():
-    """Load existing Qdrant vector store ONLY"""
+    """Load existing Qdrant vector store with connection management"""
     try:
         # Check dependencies first
         if not check_dependencies():
             return None, None, None
         
-        # Load environment variables
-        load_dotenv()
-        
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            logger.error("❌ GOOGLE_API_KEY not found in environment variables.")
-            logger.error("   Please create a .env file with: GOOGLE_API_KEY=your_api_key_here")
+        # Validate environment
+        if not validate_environment():
             return None, None, None
+        
+        # Load environment variables
+        google_api_key = os.getenv("GOOGLE_API_KEY")
         
         # Initialize embeddings
         embeddings = GoogleGenerativeAIEmbeddings(
@@ -544,38 +638,40 @@ def load_existing_vector_store():
             top_p=0.95
         )
         
-        # Get single Qdrant client instance
-        client = get_single_qdrant_client()
+        # Get Qdrant client from connection manager
+        client = connection_manager.get_connection()
         if not client:
             return None, None, None
         
-        # Create collection if it doesn't exist
-        if not create_qdrant_collection_if_not_exists(client, COLLECTION_NAME):
-            logger.error("❌ Failed to create/verify Qdrant collection")
-            return None, None, None
-        
-        # Check if collection has documents
         try:
+            # Create collection if it doesn't exist
+            if not create_qdrant_collection_if_not_exists(client, COLLECTION_NAME):
+                logger.error("❌ Failed to create/verify Qdrant collection")
+                return None, None, None
+            
+            # Check if collection has documents
             collection_info = client.get_collection(COLLECTION_NAME)
             if collection_info.points_count == 0:
                 logger.error("❌ Qdrant collection is empty! Please run sync.py first.")
+                connection_manager.return_connection(client)
                 return None, None, None
             
             logger.info(f"✅ Found {collection_info.points_count} documents in Qdrant")
-        except Exception as e:
-            logger.error(f"❌ Failed to check collection info: {e}")
-            return None, None, None
-        
-        # Create vector store
-        try:
+            
+            # Create vector store
             vectordb = QdrantVectorStore(
                 client=client,
                 collection_name=COLLECTION_NAME,
                 embedding=embeddings
             )
+            
             logger.info("✅ Loaded Qdrant vector store successfully")
+            # Don't return connection to pool as vectordb will use it
             return llm, vectordb, embeddings
+            
         except Exception as e:
+            # Return connection to pool on error
+            connection_manager.return_connection(client)
             logger.error(f"❌ Failed to create Qdrant vector store: {e}")
             return None, None, None
         
@@ -615,10 +711,12 @@ def get_knowledge_base_stats():
         # Get Qdrant stats safely
         qdrant_docs = 0
         try:
-            client = get_single_qdrant_client()
+            client = connection_manager.get_connection()
             if client:
-                collection_info = client.get_collection(COLLECTION_NAME)
-                qdrant_docs = collection_info.points_count
+                with qdrant_operation_lock():
+                    collection_info = client.get_collection(COLLECTION_NAME)
+                    qdrant_docs = collection_info.points_count
+                connection_manager.return_connection(client)
         except Exception as e:
             logger.warning(f"⚠️ Could not get Qdrant stats: {e}")
         
@@ -678,7 +776,6 @@ def reload_chatbot_if_needed(qa_chain, vectordb):
             chatbot_needs_reload.clear()  # Clear flag even if failed to prevent infinite retries
     
     return qa_chain, vectordb
-
 
 def format_source_info(source_docs):
     """Format source document information"""
@@ -941,6 +1038,15 @@ def interactive_setup():
         if api_key:
             with open(".env", "w") as f:
                 f.write(f"GOOGLE_API_KEY={api_key}\n")
+                # Add Qdrant configuration
+                qdrant_url = input("Please enter your Qdrant URL (or press Enter for default): ").strip()
+                if qdrant_url:
+                    f.write(f"QDRANT_URL={qdrant_url}\n")
+                
+                qdrant_api_key = input("Please enter your Qdrant API Key (or press Enter if not needed): ").strip()
+                if qdrant_api_key:
+                    f.write(f"QDRANT_API_KEY={qdrant_api_key}\n")
+                    
             print("✅ .env file created!")
         else:
             print("❌ API key is required!")
@@ -957,8 +1063,8 @@ def interactive_setup():
 
 if __name__ == "__main__":
     try:
-        # Check if this is first run
-        if not Path(SQLITE_PATH).exists() and not Path(QDRANT_PATH).exists():
+        # Check if this is first run (fixed the condition)
+        if not Path(SQLITE_PATH).exists():
             if not interactive_setup():
                 print("❌ Setup failed. Please check the requirements and try again.")
                 sys.exit(1)
