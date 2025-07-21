@@ -9,6 +9,10 @@ import signal
 import sys
 import threading
 from flask import send_from_directory  # Add this line
+import subprocess
+import threading
+import time
+import atexit
 
 # Core imports - same as debug script
 from qdrant_client import QdrantClient
@@ -27,6 +31,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 COLLECTION_NAME = "kb_collection"
 SQLITE_PATH = "./file_index.db"  # Same as sync.py
+SYNC_BATCH_FILE = r"C:\Users\maria selciya\Desktop\sync_loop.bat"  # Update path as needed
+SYNC_ENABLED = True  # Set to False to disable auto-sync
 
 # Validate environment variables
 def validate_environment():
@@ -51,18 +57,40 @@ class KnowledgeBaseManager:
         self.cursor = None
     
     def init_database_connection(self):
-        """Initialize SQLite database connection"""
         try:
+            # Close existing connection if any
+            if self.conn:
+                self.conn.close()
+            
             if not os.path.exists(SQLITE_PATH):
                 logger.warning(f"⚠️ Database file not found: {SQLITE_PATH}")
                 return False
-                
-            self.conn = sqlite3.connect(SQLITE_PATH, timeout=30)
+        
+            # Use check_same_thread=False for Flask threading
+            self.conn = sqlite3.connect(SQLITE_PATH, timeout=30, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row  # Enable dict-like access
             self.cursor = self.conn.cursor()
+        
+            # Test connection
+            self.cursor.execute("SELECT COUNT(*) FROM file_index")
+            logger.info(f"✅ Database connected successfully")
             return True
         except Exception as e:
             logger.error(f"❌ Database connection failed: {e}")
             return False
+
+    def ensure_connection(self):
+        """Ensure database connection is active, reconnect if needed"""
+        try:
+            if not self.conn:
+                return self.init_database_connection()
+        
+            # Test connection
+            self.cursor.execute("SELECT 1")
+            return True
+        except (sqlite3.Error, AttributeError):
+            logger.warning("🔄 Database connection lost, reconnecting...")
+            return self.init_database_connection()
     
     def close_database_connection(self):
         """Close database connection"""
@@ -74,7 +102,7 @@ class KnowledgeBaseManager:
     def get_database_files(self):
         """Get all files from the database with detailed information"""
         try:
-            if not self.conn and not self.init_database_connection():
+            if not self.ensure_connection():
                 return {"error": "Database connection failed", "success": False}
             
             # Get all files with their metadata
@@ -229,6 +257,92 @@ class KnowledgeBaseManager:
             logger.error(f"❌ File search failed: {e}")
             return {"error": str(e), "success": False}
 
+class SyncManager:
+    """Manager for handling rclone sync process"""
+    
+    def __init__(self):
+        self.sync_process = None
+        self.sync_thread = None
+        self.should_run = False
+        
+    def start_sync(self):
+        """Start the rclone sync process"""
+        try:
+            if not SYNC_ENABLED:
+                logger.info("📋 Sync is disabled in configuration")
+                return False
+                
+            if not os.path.exists(SYNC_BATCH_FILE):
+                logger.error(f"❌ Sync batch file not found: {SYNC_BATCH_FILE}")
+                return False
+            
+            logger.info("🔄 Starting rclone sync process...")
+            self.should_run = True
+            
+            # Start sync in a separate thread
+            self.sync_thread = threading.Thread(target=self._run_sync, daemon=True)
+            self.sync_thread.start()
+            
+            logger.info("✅ Rclone sync started successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to start sync: {e}")
+            return False
+    
+    def _run_sync(self):
+        """Run the sync process in a loop"""
+        while self.should_run:
+            try:
+                logger.info("🔄 Running rclone sync...")
+                
+                # Run the batch file
+                self.sync_process = subprocess.Popen(
+                    SYNC_BATCH_FILE,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW  # Hide console window
+                )
+                
+                # Wait for 30 seconds or until process completes
+                try:
+                    stdout, stderr = self.sync_process.communicate(timeout=30)
+                    if stdout:
+                        logger.debug(f"Sync output: {stdout.decode()}")
+                    if stderr:
+                        logger.warning(f"Sync warnings: {stderr.decode()}")
+                except subprocess.TimeoutExpired:
+                    # This is expected as the batch file runs in a loop
+                    pass
+                
+                # Wait before next check
+                time.sleep(5)
+                
+            except Exception as e:
+                logger.error(f"❌ Sync process error: {e}")
+                time.sleep(30)  # Wait before retrying
+    
+    def stop_sync(self):
+        """Stop the sync process"""
+        try:
+            logger.info("🛑 Stopping rclone sync process...")
+            self.should_run = False
+            
+            if self.sync_process:
+                self.sync_process.terminate()
+                try:
+                    self.sync_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.sync_process.kill()
+                
+            logger.info("✅ Rclone sync stopped")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to stop sync: {e}")
+            return False
+
 class ChatbotAPI:
     def __init__(self):
         self.client = None
@@ -238,72 +352,94 @@ class ChatbotAPI:
         self.initialized = False
         self.shutdown_requested = False
         self.kb_manager = KnowledgeBaseManager()  # Add KB manager
-    
+        self.sync_manager = SyncManager()  # Add this line
+
     def initialize(self):
         """Initialize all components - following debug.py pattern"""
         try:
             validate_environment()
             
-            # Initialize Gemini Embeddings (same as debug.py)
-            logger.info("🧬 Initializing Gemini Embeddings...")
-            self.embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/embedding-001",
-                google_api_key=os.getenv("GOOGLE_API_KEY")
+            # Initialize Qdrant client
+            logger.info("🔗 Connecting to Qdrant Cloud...")
+            self.client = QdrantClient(
+                url=os.getenv("QDRANT_URL"),
+                api_key=os.getenv("QDRANT_API_KEY"),
+                timeout=30
             )
-            
-            # Test embedding to ensure it works
-            test_vec = self.embeddings.embed_query("test vector")
-            logger.info(f"✅ Gemini Embeddings ready! Vector size: {len(test_vec)}")
-            
-            # Initialize Qdrant Cloud Client (same as debug.py)
-            logger.info("🔌 Connecting to Qdrant Cloud...")
-            qdrant_url = os.getenv('QDRANT_URL')
-            qdrant_api_key = os.getenv('QDRANT_API_KEY')
-            
-            self.client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-            
-            # Verify connection and collection
-            collections = self.client.get_collections()
-            collection_names = [col.name for col in collections.collections]
-            logger.info(f"✅ Connected to: {qdrant_url}")
-            logger.info(f"📁 Collections found: {collection_names}")
-            
-            if COLLECTION_NAME not in collection_names:
-                logger.warning(f"⚠️ Collection '{COLLECTION_NAME}' not found!")
-                return False
-            
-            # Get collection stats
-            info = self.client.get_collection(COLLECTION_NAME)
-            logger.info(f"📊 {COLLECTION_NAME} Stats → Points: {info.points_count}, Size: {info.config.params.vectors.size}")
-            
-            # Initialize VectorStore (same pattern as debug.py)
-            self.vectorstore = QdrantVectorStore(
-                client=self.client,
-                collection_name=COLLECTION_NAME,
-                embedding=self.embeddings,
-            )
-            
-            # Initialize LLM
-            logger.info("🤖 Initializing Gemini LLM...")
-            self.llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                google_api_key=os.getenv("GOOGLE_API_KEY"),
-                temperature=0.7,
-                convert_system_message_to_human=True
-            )
-            
-            # Test search to verify everything works
-            logger.info("🔍 Testing vectorstore search...")
-            test_results = self.vectorstore.similarity_search("test query", k=1)
-            logger.info(f"✅ Search test successful, found {len(test_results)} results")
-            
-            # Initialize KB manager database connection
-            self.kb_manager.init_database_connection()
+
+            # Start sync manager after successful initialization
+            if SYNC_ENABLED:
+                logger.info("🔄 Starting automatic sync...")
+                sync_started = self.sync_manager.start_sync()
+                if sync_started:
+                    logger.info("✅ Automatic sync started")
+                else:
+                    logger.warning("⚠️ Failed to start automatic sync")
             
             self.initialized = True
             logger.info("🎉 ChatbotAPI initialized successfully!")
             return True
-            
+        
+        except Exception as e:
+            logger.error(f"❌ Initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+            # Test connection
+            collections = self.client.get_collections()
+            logger.info(f"✅ Connected to Qdrant Cloud: {len(collections.collections)} collections found")
+        
+            # Initialize embeddings
+            logger.info("🔤 Initializing Google embeddings...")
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=os.getenv("GOOGLE_API_KEY")
+            )
+        
+            # Initialize vector store
+            logger.info("📚 Setting up vector store...")
+            self.vectorstore = QdrantVectorStore(
+                client=self.client,
+                collection_name=COLLECTION_NAME,
+                embedding=self.embeddings
+            )
+        
+            # Initialize LLM
+            logger.info("🤖 Initializing Gemini LLM...")
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-pro",
+                google_api_key=os.getenv("GOOGLE_API_KEY"),
+                temperature=0.1,
+                convert_system_message_to_human=True
+            )
+        
+            # Test vector store
+            try:
+                # Try to get collection info to verify everything is working
+                collection_info = self.client.get_collection(COLLECTION_NAME)
+                logger.info(f"✅ Vector store ready: {collection_info.points_count} points in collection")
+            except Exception as e:
+                logger.warning(f"⚠️ Collection test failed: {e}")
+                # ... existing initialization code ...
+        
+            # Initialize KB manager database connection - REFRESH CONNECTION
+            logger.info("🗄️ Initializing database connection...")
+            if not self.kb_manager.init_database_connection():
+                logger.warning("⚠️ Database connection failed, API will work with vector DB only")
+            else:
+                # Test database with a quick query
+                test_result = self.kb_manager.get_database_files()
+                if test_result.get('success'):
+                    file_count = test_result.get('summary', {}).get('total_files', 0)
+                    logger.info(f"✅ Database connected: {file_count} files found")
+                else:
+                    logger.warning("⚠️ Database test query failed")
+        
+            self.initialized = True
+            logger.info("🎉 ChatbotAPI initialized successfully!")
+            return True
+        
         except Exception as e:
             logger.error(f"❌ Initialization failed: {e}")
             import traceback
@@ -825,6 +961,46 @@ def search_knowledge_base_files():
             "error": str(e),
             "success": False
         }), 500
+    
+@app.route('/knowledge-base/refresh', methods=['POST'])
+def refresh_database_connection():
+    """Refresh database connection to pick up latest changes"""
+    try:
+        logger.info("🔄 Refreshing database connection...")
+        
+        # Reinitialize database connection
+        success = chatbot.kb_manager.init_database_connection()
+        
+        if success:
+            # Test with a quick query
+            test_result = chatbot.kb_manager.get_database_files()
+            if test_result.get('success'):
+                file_count = test_result.get('summary', {}).get('total_files', 0)
+                return jsonify({
+                    "success": True,
+                    "message": f"Database connection refreshed successfully",
+                    "files_count": file_count,
+                    "timestamp": datetime.now().isoformat()
+                })
+            else:
+                return jsonify({
+                    "success": False,
+                    "message": "Database connection established but query test failed",
+                    "error": test_result.get('error')
+                }), 500
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to refresh database connection"
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Database refresh error: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "message": "Database refresh failed"
+        }), 500
 
 @app.route('/knowledge-base/summary', methods=['GET'])
 def get_knowledge_base_summary():
@@ -876,6 +1052,9 @@ def get_knowledge_base_summary():
 def list_files():
     """List all files with comprehensive information including summary"""
     try:
+        if not chatbot.kb_manager.ensure_connection():
+            logger.warning("⚠️ Could not establish database connection")
+        
         # Get files from SQLite database (includes summary)
         db_result = chatbot.kb_manager.get_database_files()
         
@@ -1053,6 +1232,37 @@ def search_endpoint():
             "success": False
         }), 500
 
+@app.route('/test-database', methods=['GET'])
+def test_database_integration():
+    """Test endpoint to verify database integration"""
+    try:
+        # Test database connection
+        db_success = chatbot.kb_manager.ensure_connection()
+        
+        # Test database query
+        db_result = chatbot.kb_manager.get_database_files()
+        
+        # Test vector database
+        vector_result = chatbot.get_files_in_database()
+        
+        return jsonify({
+            "database_connection": db_success,
+            "database_files": db_result.get('success', False),
+            "database_file_count": db_result.get('summary', {}).get('total_files', 0),
+            "vector_db_success": vector_result.get('success', False),
+            "vector_file_count": vector_result.get('total_files', 0),
+            "database_path": SQLITE_PATH,
+            "database_exists": os.path.exists(SQLITE_PATH),
+            "database_size": os.path.getsize(SQLITE_PATH) if os.path.exists(SQLITE_PATH) else 0,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
 @app.route('/collections', methods=['GET'])
 def list_collections():
     """List available Qdrant collections"""
@@ -1143,6 +1353,160 @@ def home():
         }
     })
 
+@app.route('/sync/status', methods=['GET'])
+def get_sync_status():
+    """Get sync process status"""
+    try:
+        is_running = chatbot.sync_manager.should_run if hasattr(chatbot, 'sync_manager') else False
+        
+        return jsonify({
+            "sync_enabled": SYNC_ENABLED,
+            "sync_running": is_running,
+            "sync_batch_file": SYNC_BATCH_FILE,
+            "batch_file_exists": os.path.exists(SYNC_BATCH_FILE),
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
+@app.route('/sync/start', methods=['POST'])
+def start_sync():
+    """Manually start sync process"""
+    try:
+        if not hasattr(chatbot, 'sync_manager'):
+            return jsonify({
+                "error": "Sync manager not available",
+                "success": False
+            }), 500
+        
+        success = chatbot.sync_manager.start_sync()
+        
+        return jsonify({
+            "success": success,
+            "message": "Sync started successfully" if success else "Failed to start sync",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
+@app.route('/sync', methods=['POST'])
+def sync_knowledge_base():
+    """Sync knowledge base with filesystem using sync.py"""
+    try:
+        import subprocess
+        import sys
+        import os
+        from pathlib import Path
+        
+        # Get the directory where your sync.py is located
+        # Adjust this path to match your sync.py location
+        sync_script_path = Path(__file__).parent / "sync.py"
+        
+        if not sync_script_path.exists():
+            return jsonify({
+                'success': False,
+                'error': f'Sync script not found at {sync_script_path}'
+            })
+        
+        # Get force_rebuild parameter
+        data = request.get_json() or {}
+        force_rebuild = data.get('force_rebuild', False)
+        
+        # Build command
+        cmd = [sys.executable, str(sync_script_path)]
+        if force_rebuild:
+            cmd.append('--rebuild')
+        
+        # Run sync script
+        logger.info(f"Running sync command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        # Check result
+        if result.returncode == 0:
+            # Parse output for summary info
+            output_lines = result.stdout.strip().split('\n')
+            summary_info = {}
+            
+            for line in output_lines:
+                if 'Added/Updated:' in line:
+                    summary_info['added'] = line.split(':')[1].strip()
+                elif 'Removed:' in line:
+                    summary_info['removed'] = line.split(':')[1].strip()
+                elif 'Failed:' in line:
+                    summary_info['failed'] = line.split(':')[1].strip()
+            
+            # Create message
+            message = f"Added: {summary_info.get('added', '0')}, Removed: {summary_info.get('removed', '0')}"
+            if summary_info.get('failed', '0') != '0':
+                message += f", Failed: {summary_info.get('failed', '0')}"
+            
+            return jsonify({
+                'success': True,
+                'message': message,
+                'output': result.stdout,
+                'summary': summary_info
+            })
+        else:
+            logger.error(f"Sync failed with return code {result.returncode}")
+            logger.error(f"STDOUT: {result.stdout}")
+            logger.error(f"STDERR: {result.stderr}")
+            
+            return jsonify({
+                'success': False,
+                'error': f'Sync failed: {result.stderr or result.stdout or "Unknown error"}',
+                'return_code': result.returncode
+            })
+            
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'error': 'Sync operation timed out (5 minutes)'
+        })
+    except Exception as e:
+        logger.error(f"Sync endpoint error: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'Sync error: {str(e)}'
+        })
+    
+@app.route('/sync/stop', methods=['POST'])
+def stop_sync():
+    """Manually stop sync process"""
+    try:
+        if not hasattr(chatbot, 'sync_manager'):
+            return jsonify({
+                "error": "Sync manager not available",
+                "success": False
+            }), 500
+        
+        success = chatbot.sync_manager.stop_sync()
+        
+        return jsonify({
+            "success": success,
+            "message": "Sync stopped successfully" if success else "Failed to stop sync",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
 # Signal handlers for graceful shutdown
 def signal_handler(signum, frame):
     logger.info(f"🔴 Received signal {signum}, shutting down gracefully...")
@@ -1159,6 +1523,12 @@ if __name__ == '__main__':
     # Initialize on startup
     logger.info("🚀 Starting Enhanced Chatbot API...")
     
+    def cleanup():
+        logger.info("🧹 Performing cleanup...")
+        if 'chatbot' in globals():
+            chatbot.shutdown()
+    
+    atexit.register(cleanup)
     # Test initialization
     if chatbot.initialize():
         logger.info("✅ Chatbot initialized successfully on startup")

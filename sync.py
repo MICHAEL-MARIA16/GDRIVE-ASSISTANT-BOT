@@ -1,9 +1,10 @@
-# === Optimized Knowledge Base Sync with Schema Migration ===
+# === Fixed Unicode Handling in sync.py ===
 import os
 import sqlite3
 import hashlib
 import json
 import uuid
+import sys
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -14,6 +15,24 @@ from langchain.schema import Document
 import logging
 import pandas as pd
 
+# === FIX 1: Set UTF-8 encoding for stdout/stderr ===
+if sys.platform.startswith('win'):
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+
+# === FIX 2: Safe print function that handles Unicode ===
+def safe_print(message):
+    """Safely print messages, handling Unicode encoding issues"""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        # Fallback: print without emojis/special chars
+        safe_message = message.encode('ascii', errors='ignore').decode('ascii')
+        print(safe_message)
+    except Exception as e:
+        print(f"Print error: {str(e)}")
+
 # Qdrant imports - using the same pattern as your working debug script
 try:
     from qdrant_client import QdrantClient
@@ -21,7 +40,7 @@ try:
     from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
     QDRANT_AVAILABLE = True
 except ImportError:
-    print("❌ Qdrant imports failed. Please install: pip install qdrant-client langchain-qdrant")
+    safe_print("ERROR: Qdrant imports failed. Please install: pip install qdrant-client langchain-qdrant")
     QDRANT_AVAILABLE = False
 
 # DOCX support
@@ -43,8 +62,8 @@ SUPPORTED_EXTENSIONS = {'.pdf', '.txt', '.csv', '.docx', '.md', '.py', '.js', '.
 
 # Validate KB_PATH exists
 if not os.path.exists(KB_PATH):
-    print(f"❌ ERROR: KB_PATH does not exist: {KB_PATH}")
-    print(f"Please create the directory or update KB_PATH in the script")
+    safe_print(f"ERROR: KB_PATH does not exist: {KB_PATH}")
+    safe_print(f"Please create the directory or update KB_PATH in the script")
     exit(1)
 
 class KnowledgeBaseSync:
@@ -74,7 +93,7 @@ class KnowledgeBaseSync:
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
         
-        print(f"🔌 Connecting to Qdrant Cloud: {qdrant_url}")
+        safe_print(f"Connecting to Qdrant Cloud: {qdrant_url}")
         
         # Initialize Qdrant CLOUD client - same as your working debug script
         self.client = QdrantClient(
@@ -95,17 +114,17 @@ class KnowledgeBaseSync:
             
             if COLLECTION_NAME in collection_names:
                 collection_info = self.client.get_collection(COLLECTION_NAME)
-                logger.info(f"✅ Connected to existing collection '{COLLECTION_NAME}' - Points: {collection_info.points_count}")
+                logger.info(f"Connected to existing collection '{COLLECTION_NAME}' - Points: {collection_info.points_count}")
             else:
-                logger.info(f"📁 Creating new collection: {COLLECTION_NAME}")
+                logger.info(f"Creating new collection: {COLLECTION_NAME}")
                 self.client.create_collection(
                     collection_name=COLLECTION_NAME,
                     vectors_config=VectorParams(size=768, distance=Distance.COSINE)
                 )
-                logger.info("✅ Collection created successfully!")
+                logger.info("Collection created successfully!")
                 
         except Exception as e:
-            logger.error(f"❌ Qdrant connection failed: {e}")
+            logger.error(f"Qdrant connection failed: {e}")
             raise
         
         # Initialize vectorstore - same pattern as debug script
@@ -117,7 +136,7 @@ class KnowledgeBaseSync:
         
         # Initialize database with migration
         self.init_database()
-        logger.info("✅ All components initialized for CLOUD sync")
+        logger.info("All components initialized for CLOUD sync")
     
     def check_column_exists(self, table_name, column_name):
         """Check if a column exists in a table"""
@@ -127,14 +146,14 @@ class KnowledgeBaseSync:
     
     def migrate_database_schema(self):
         """Migrate database schema to latest version"""
-        logger.info("🔄 Checking database schema...")
+        logger.info("Checking database schema...")
         
         # Check if table exists
         self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_index'")
         table_exists = self.cursor.fetchone() is not None
         
         if not table_exists:
-            logger.info("📋 Creating new file_index table...")
+            logger.info("Creating new file_index table...")
             self.cursor.execute("""
                 CREATE TABLE file_index (
                     filename TEXT PRIMARY KEY,
@@ -158,14 +177,14 @@ class KnowledgeBaseSync:
             
             for column_name, column_def in columns_to_add:
                 if not self.check_column_exists('file_index', column_name):
-                    logger.info(f"➕ Adding missing column: {column_name}")
+                    logger.info(f"Adding missing column: {column_name}")
                     self.cursor.execute(f"ALTER TABLE file_index ADD COLUMN {column_name} {column_def}")
             
             # Update filepath for existing records if empty
             self.cursor.execute("UPDATE file_index SET filepath = filename WHERE filepath = '' OR filepath IS NULL")
         
         self.conn.commit()
-        logger.info("✅ Database schema migration completed")
+        logger.info("Database schema migration completed")
     
     def init_database(self):
         """Initialize SQLite database with migration"""
@@ -263,9 +282,9 @@ class KnowledgeBaseSync:
                     collection_name=COLLECTION_NAME,
                     points_selector=point_ids
                 )
-                logger.info(f"🗑️ Removed {len(point_ids)} vectors for: {filename}")
+                logger.info(f"Removed {len(point_ids)} vectors for: {filename}")
             else:
-                logger.info(f"ℹ️ No vectors found for: {filename}")
+                logger.info(f"No vectors found for: {filename}")
             
             return True
         except Exception as e:
@@ -276,7 +295,7 @@ class KnowledgeBaseSync:
         """Add file to vector store"""
         try:
             filename = file_path.name
-            print(f"🔄 PROCESSING: {filename}")
+            safe_print(f"PROCESSING: {filename}")
             
             # Remove existing vectors first
             self.remove_from_vectorstore(filename)
@@ -313,7 +332,7 @@ class KnowledgeBaseSync:
                 try:
                     ids = self.vectorstore.add_documents(batch)
                     total_added += len(batch)
-                    print(f"   📦 Batch {i//batch_size + 1}: Added {len(batch)} chunks")
+                    safe_print(f"   Batch {i//batch_size + 1}: Added {len(batch)} chunks")
                 except Exception as e:
                     logger.error(f"Failed to add batch {i//batch_size + 1}: {e}")
                     # Continue with next batch
@@ -333,7 +352,7 @@ class KnowledgeBaseSync:
                   file_stats.st_size, file_stats.st_mtime, file_hash, total_added))
             self.conn.commit()
             
-            print(f"✅ ADDED: {filename} ({total_added} chunks)")
+            safe_print(f"ADDED: {filename} ({total_added} chunks)")
             return True
             
         except Exception as e:
@@ -352,7 +371,7 @@ class KnowledgeBaseSync:
             self.cursor.execute("DELETE FROM file_index WHERE filename = ?", (filename,))
             self.conn.commit()
             
-            logger.info(f"🗑️ Completely removed: {filename}")
+            logger.info(f"Completely removed: {filename}")
             return True
             
         except Exception as e:
@@ -395,22 +414,22 @@ class KnowledgeBaseSync:
         """)
         files = self.cursor.fetchall()
         
-        print("\n" + "="*60)
-        print("📋 CURRENT DATABASE FILES:")
-        print("="*60)
+        safe_print("\n" + "="*60)
+        safe_print("CURRENT DATABASE FILES:")
+        safe_print("="*60)
         
         if files:
             for filename, file_type, chunk_count, indexed_at in files:
-                print(f"✅ {filename} ({file_type}) - {chunk_count} chunks")
+                safe_print(f"SUCCESS: {filename} ({file_type}) - {chunk_count} chunks")
         else:
-            print("📭 No files in database")
+            safe_print("No files in database")
         
-        print(f"📊 Total: {len(files)} files")
-        print("="*60)
+        safe_print(f"Total: {len(files)} files")
+        safe_print("="*60)
     
     def rebuild_database(self):
         """Rebuild database from scratch"""
-        logger.info("🔄 Rebuilding database from scratch...")
+        logger.info("Rebuilding database from scratch...")
         
         # Drop and recreate table
         self.cursor.execute("DROP TABLE IF EXISTS file_index")
@@ -427,30 +446,30 @@ class KnowledgeBaseSync:
             )
         """)
         self.conn.commit()
-        logger.info("✅ Database rebuilt")
+        logger.info("Database rebuilt")
     
     def test_search(self):
         """Test search functionality"""
         try:
-            print("\n🔍 Testing search functionality...")
+            safe_print("\nTesting search functionality...")
             results = self.vectorstore.similarity_search("test query", k=1)
             if results:
-                print(f"✅ Search working! Found {len(results)} results")
-                print(f"📄 Sample: {results[0].page_content[:100]}...")
+                safe_print(f"Search working! Found {len(results)} results")
+                safe_print(f"Sample: {results[0].page_content[:100]}...")
             else:
-                print("ℹ️ No results found (collection might be empty)")
+                safe_print("No results found (collection might be empty)")
             return True
         except Exception as e:
-            print(f"❌ Search test failed: {e}")
+            safe_print(f"Search test failed: {e}")
             return False
     
     def sync(self, force_rebuild=False):
         """Main sync function - optimized for real-time updates"""
         try:
-            logger.info("🚀 Starting knowledge base sync...")
+            logger.info("Starting knowledge base sync...")
             
             if not QDRANT_AVAILABLE:
-                print("❌ Qdrant not available. Please install required packages.")
+                safe_print("Qdrant not available. Please install required packages.")
                 return False
             
             if not self.client:
@@ -464,11 +483,11 @@ class KnowledgeBaseSync:
             current_files = self.get_current_files()
             db_files = self.get_database_files()
             
-            print(f"📂 Found {len(current_files)} supported files in directory")
+            safe_print(f"Found {len(current_files)} supported files in directory")
             
             if len(current_files) == 0:
-                print(f"⚠️ No supported files found in {KB_PATH}")
-                print(f"Supported extensions: {SUPPORTED_EXTENSIONS}")
+                safe_print(f"WARNING: No supported files found in {KB_PATH}")
+                safe_print(f"Supported extensions: {SUPPORTED_EXTENSIONS}")
                 return False
             
             # Find changes
@@ -495,9 +514,9 @@ class KnowledgeBaseSync:
             # Remove deleted files
             for filename in to_remove:
                 if self.remove_file(filename):
-                    print(f"🗑️ REMOVED: {filename}")
+                    safe_print(f"REMOVED: {filename}")
                 else:
-                    print(f"❌ FAILED TO REMOVE: {filename}")
+                    safe_print(f"FAILED TO REMOVE: {filename}")
             
             # Add/update files
             for file_path in to_add:
@@ -505,7 +524,7 @@ class KnowledgeBaseSync:
                     added_count += 1
                 else:
                     failed_count += 1
-                    print(f"❌ FAILED: {file_path.name}")
+                    safe_print(f"FAILED: {file_path.name}")
             
             # Test search if we have data
             if added_count > 0 or len(db_files) > 0:
@@ -515,13 +534,13 @@ class KnowledgeBaseSync:
             self.print_current_files()
             
             # Summary
-            print(f"\n🎉 SYNC COMPLETE!")
-            print(f"✅ Added/Updated: {added_count}")
-            print(f"🗑️ Removed: {len(to_remove)}")
-            print(f"❌ Failed: {failed_count}")
+            safe_print(f"\nSYNC COMPLETE!")
+            safe_print(f"Added/Updated: {added_count}")
+            safe_print(f"Removed: {len(to_remove)}")
+            safe_print(f"Failed: {failed_count}")
             
             if added_count == 0 and len(to_remove) == 0:
-                print("ℹ️ No changes detected - database is up to date")
+                safe_print("No changes detected - database is up to date")
             
             return True
             
@@ -560,11 +579,11 @@ def test_connection():
     syncer = KnowledgeBaseSync()
     try:
         syncer.initialize()
-        print("✅ Connection test successful!")
+        safe_print("Connection test successful!")
         syncer.test_search()
         return True
     except Exception as e:
-        print(f"❌ Connection test failed: {e}")
+        safe_print(f"Connection test failed: {e}")
         return False
     finally:
         syncer.cleanup()
@@ -574,14 +593,14 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "--rebuild":
-        print("🔄 Running with --rebuild flag (will recreate database)")
+        safe_print("Running with --rebuild flag (will recreate database)")
         sync_kb(force_rebuild=True)
     elif len(sys.argv) > 1 and sys.argv[1] == "--list":
-        print("📋 Listing current files in database")
+        safe_print("Listing current files in database")
         list_files()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test":
-        print("🔍 Testing connection")
+        safe_print("Testing connection")
         test_connection()
     else:
-        print("🚀 Running normal sync")
+        safe_print("Running normal sync")
         sync_kb()

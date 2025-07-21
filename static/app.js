@@ -30,6 +30,10 @@ class ChatbotApp {
         document.getElementById('quitBtn')?.addEventListener('click', () => this.quitServer());
         document.getElementById('initializeBtn')?.addEventListener('click', () => this.initializeChatbot());
         
+        // In your setupEventListeners method, update this line:
+
+        // Refresh knowledge base - UPDATED TO INCLUDE SYNC
+        document.getElementById('refreshKbBtn')?.addEventListener('click', () => this.loadKnowledgeBase(true));
         // Chat functionality
         document.getElementById('sendBtn')?.addEventListener('click', () => this.sendMessage());
         document.getElementById('chatInput')?.addEventListener('keypress', (e) => {
@@ -228,30 +232,63 @@ class ChatbotApp {
         }
     }
 
-    async loadKnowledgeBase() {
-        try {
-            this.showLoading('Loading knowledge base...');
+    async loadKnowledgeBase(forceSync = false) {
+    try {
+        // If forceSync is true, run sync first
+        if (forceSync) {
+            this.showLoading('Syncing knowledge base with filesystem...');
             
-            const response = await fetch(`${this.apiUrl}/files`);
-            const data = await response.json();
-            
-            if (data.success) {
-                this.knowledgeBaseFiles = data.files || [];
-                this.displayKnowledgeBase(data);
-                this.showNotification('✅ Knowledge base loaded successfully!', 'success');
-            } else {
-                this.showNotification('❌ Failed to load knowledge base: ' + (data.error || 'Unknown error'), 'error');
-                this.displayKnowledgeBaseError(data.error || 'Unknown error');
+            try {
+                const syncResponse = await fetch(`${this.apiUrl}/sync`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        force_rebuild: false // Set to true if you want to force rebuild
+                    })
+                });
+                
+                const syncData = await syncResponse.json();
+                
+                if (syncData.success) {
+                    this.showNotification(`✅ Sync completed! ${syncData.message || 'Database updated'}`, 'success');
+                } else {
+                    this.showNotification('⚠️ Sync completed with warnings: ' + (syncData.error || 'Unknown error'), 'warning');
+                }
+            } catch (syncError) {
+                console.error('Sync failed:', syncError);
+                this.showNotification('❌ Sync failed: ' + syncError.message, 'error');
+                // Continue to load files even if sync failed
             }
-            
-        } catch (error) {
-            console.error('Failed to load knowledge base:', error);
-            this.showNotification('❌ Failed to load knowledge base: ' + error.message, 'error');
-            this.displayKnowledgeBaseError(error.message);
-        } finally {
-            this.hideLoading();
         }
+        
+        // Now load the knowledge base files
+        this.showLoading('Loading knowledge base files...');
+        
+        const response = await fetch(`${this.apiUrl}/files`);
+        const data = await response.json();
+        
+        if (data.success) {
+            this.knowledgeBaseFiles = data.files || [];
+            this.displayKnowledgeBase(data);
+            
+            if (!forceSync) {
+                this.showNotification('✅ Knowledge base loaded successfully!', 'success');
+            }
+        } else {
+            this.showNotification('❌ Failed to load knowledge base: ' + (data.error || 'Unknown error'), 'error');
+            this.displayKnowledgeBaseError(data.error || 'Unknown error');
+        }
+        
+    } catch (error) {
+        console.error('Failed to load knowledge base:', error);
+        this.showNotification('❌ Failed to load knowledge base: ' + error.message, 'error');
+        this.displayKnowledgeBaseError(error.message);
+    } finally {
+        this.hideLoading();
     }
+}
 
     displayKnowledgeBase(data) {
         const container = document.getElementById('knowledgeBaseContent');
@@ -332,8 +369,25 @@ class ChatbotApp {
         container.innerHTML = html;
         
         // Re-attach event listeners
-        document.getElementById('refreshKbBtn')?.addEventListener('click', () => this.loadKnowledgeBase());
+        this.reattachKnowledgeBaseEventListeners();
     }
+
+   reattachKnowledgeBaseEventListeners() {
+    // Re-attach refresh button listener - NOW WITH SYNC
+    const refreshBtn = document.getElementById('refreshKbBtn');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => this.loadKnowledgeBase(true)); // Pass true to force sync
+    }
+    
+    // Re-attach all file detail button listeners
+    const fileDetailBtns = document.querySelectorAll('.file-detail-btn');
+    fileDetailBtns.forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const filename = e.target.dataset.filename;
+            this.showFileDetails(filename);
+        });
+    });
+}
 
     displayKnowledgeBaseError(error) {
         const container = document.getElementById('knowledgeBaseContent');
