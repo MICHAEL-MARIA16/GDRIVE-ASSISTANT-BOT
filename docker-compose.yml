@@ -12,6 +12,8 @@ services:
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     volumes:
+      # Mount local chatbot knowledge base folder into container
+      - C:/Users/maria selciya/Desktop/chatbotKB_test:/app/chatbotKB_test
       # Mount database file to persist data
       - ./file_index.db:/app/file_index.db
       # Mount logs directory

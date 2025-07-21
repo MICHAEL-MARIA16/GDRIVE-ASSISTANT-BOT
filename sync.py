@@ -55,7 +55,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-KB_PATH = "C:/Users/maria selciya/Desktop/chatbotKB_test"
+load_dotenv()
+KB_PATH = os.getenv("KB_PATH")
 SQLITE_PATH = "./file_index.db"
 COLLECTION_NAME = "kb_collection"
 SUPPORTED_EXTENSIONS = {'.pdf', '.txt', '.csv', '.docx', '.md', '.py', '.js', '.html', '.xml', '.json'}

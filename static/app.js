@@ -4,7 +4,7 @@
 class ChatbotApp {
     constructor() {
         // Modified to connect to Flask server on port 5000
-        this.apiUrl = 'http://localhost:5000'; // Changed from window.location.origin
+        this.apiUrl = window.location.origin; // Changed from window.location.origin
         this.isInitialized = false;
         this.currentView = 'home';
         this.chatHistory = [];

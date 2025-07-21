@@ -1482,7 +1482,8 @@ def sync_knowledge_base():
             'success': False,
             'error': f'Sync error: {str(e)}'
         })
-    
+        logger.warning("⚠️ Failed to start automatic sync")    
+        
 @app.route('/sync/stop', methods=['POST'])
 def stop_sync():
     """Manually stop sync process"""

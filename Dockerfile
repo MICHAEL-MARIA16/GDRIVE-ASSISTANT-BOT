@@ -5,6 +5,7 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV FLASK_APP=chatbot_api.py
+ENV KB_PATH=/app/chatbotKB_test
 
 # Set work directory
 WORKDIR /app
@@ -45,6 +46,10 @@ COPY . .
 
 # Create necessary directories and set permissions
 RUN mkdir -p /app/logs && \
+    touch /app/file_index.db && \
+    chown -R appuser:appuser /app
+
+RUN mkdir -p /app/logs /app/chatbotKB_test && \
     touch /app/file_index.db && \
     chown -R appuser:appuser /app
 
