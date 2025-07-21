@@ -8,6 +8,7 @@ from flask_cors import CORS
 import signal
 import sys
 import threading
+from flask import send_from_directory  # Add this line
 
 # Core imports - same as debug script
 from qdrant_client import QdrantClient
@@ -653,6 +654,7 @@ Answer:"""
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
+from flask import render_template  # already partially imported earlier
 
 # Global chatbot instance
 chatbot = ChatbotAPI()
@@ -1106,8 +1108,26 @@ def internal_error(error):
         "message": "Something went wrong on the server"
     }), 500
 
+
+@app.route('/app.js')
+def serve_app_js():
+    """Serve the app.js file from static folder"""
+    return send_from_directory('static', 'app.js')
+
+@app.route('/static/<path:filename>')
+def serve_static_files(filename):
+    """Serve static files (CSS, JS, images, etc.)"""
+    return send_from_directory('static', 'static', filename)
+
+
 @app.route('/', methods=['GET'])
 def home():
+    """Home route - serves HTML interface or JSON API info based on Accept header"""
+    # Check if request accepts HTML (browser request)
+    if request.headers.get('Accept', '').find('text/html') != -1:
+        return render_template("intellirag.html")
+    
+    # Otherwise return JSON API information
     return jsonify({
         "message": "🔥 Welcome to your Enhanced Chatbot API!",
         "endpoints": {
@@ -1131,6 +1151,9 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
+
+
+
 
 if __name__ == '__main__':
     # Initialize on startup
