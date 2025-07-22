@@ -14,12 +14,37 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 import logging
 import pandas as pd
+import sys
 
 # === FIX 1: Set UTF-8 encoding for stdout/stderr ===
 if sys.platform.startswith('win'):
     import codecs
     sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
     sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+
+import os
+import sys
+
+# Detect if running in Docker container
+def is_running_in_docker():
+    return os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER') == 'true'
+
+# Set KB_PATH based on environment
+if is_running_in_docker():
+    KB_PATH = "/app/chatbotKB_test"
+else:
+    # Use the actual Windows path when running locally
+    KB_PATH = r"C:\Users\maria selciya\Desktop\chatbotKB_test"
+
+# Check if the path exists
+if not os.path.exists(KB_PATH):
+    print(f"ERROR: KB_PATH does not exist: {KB_PATH}")
+    print("Please create the directory or update KB_PATH in the script")
+    sys.exit(1)
+
+print(f"Using KB_PATH: {KB_PATH}")
+
+# Rest of your sync.py code here...
 
 # === FIX 2: Safe print function that handles Unicode ===
 def safe_print(message):
@@ -56,7 +81,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 load_dotenv()
-KB_PATH = os.getenv("KB_PATH")
+
+#KB_PATH = os.getenv("KB_PATH", "./chatbotKB_test")
 SQLITE_PATH = "./file_index.db"
 COLLECTION_NAME = "kb_collection"
 SUPPORTED_EXTENSIONS = {'.pdf', '.txt', '.csv', '.docx', '.md', '.py', '.js', '.html', '.xml', '.json'}
