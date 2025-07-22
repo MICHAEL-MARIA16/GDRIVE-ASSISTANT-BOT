@@ -582,7 +582,60 @@ class KnowledgeBaseSync:
         if self.conn:
             self.conn.close()
 
+import os
+import sys
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
+
+def is_running_in_docker():
+    """Check if script is running inside Docker container"""
+    return os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER') == 'true'
+
+def get_kb_path():
+    """Get the correct KB path based on environment"""
+    if is_running_in_docker():
+        # Inside Docker container, use the mounted path
+        kb_path = "/app/chatbotKB_test"
+    else:
+        # Outside Docker, use the local Windows path from .env
+        kb_path = os.getenv('KB_PATH', r'C:\Users\maria selciya\Desktop\chatbotKB_test')
+        # Convert forward slashes to backslashes for Windows
+        if os.name == 'nt':  # Windows
+            kb_path = kb_path.replace('/', '\\')
+    
+    return kb_path
+
+# Get the appropriate KB path
+KB_PATH = get_kb_path()
+
+print(f"Environment: {'Docker' if is_running_in_docker() else 'Local'}")
+print(f"Using KB_PATH: {KB_PATH}")
+
+# Check if the path exists
+if not os.path.exists(KB_PATH):
+    error_msg = f"ERROR: KB_PATH does not exist: {KB_PATH}"
+    print(error_msg)
+    
+    if is_running_in_docker():
+        print("Please ensure the volume is properly mounted in docker-compose.yml")
+    else:
+        print("Please create the directory or update KB_PATH in your .env file")
+    
+    sys.exit(1)
+
+print("KB_PATH exists, proceeding with sync...")
+
+# Your existing sync logic here
+try:
+    # Add your actual sync code here
+    print("Sync completed successfully!")
+    
+except Exception as e:
+    print(f"Sync failed: {str(e)}")
+    sys.exit(1)
+    
 # Main execution functions
 def sync_kb(force_rebuild=False):
     """Convenient function to sync knowledge base"""

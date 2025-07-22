@@ -13,7 +13,9 @@ services:
     volumes:
       - ./file_index.db:/app/file_index.db
       - ./logs:/app/logs
-      - C:/Users/maria selciya/Desktop/chatbotKB_test:/app/chatbotKB_test
+      - "C:/Users/maria selciya/Desktop/chatbotKB_test:/app/chatbotKB_test"
+      - ./sync.py:/app/sync.py  # Make sure sync.py is mounted
+      - ./.env:/app/.env        # Mount .env file
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]

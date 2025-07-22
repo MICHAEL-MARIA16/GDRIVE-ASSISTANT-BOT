@@ -33,7 +33,8 @@ class ChatbotApp {
         // In your setupEventListeners method, update this line:
 
         // Refresh knowledge base - UPDATED TO INCLUDE SYNC
-        document.getElementById('refreshKbBtn')?.addEventListener('click', () => this.loadKnowledgeBase(true));
+        document.getElementById('refreshKbBtn')?.addEventListener('click', () => this.refreshKnowledgeBase());
+
         // Chat functionality
         document.getElementById('sendBtn')?.addEventListener('click', () => this.sendMessage());
         document.getElementById('chatInput')?.addEventListener('keypress', (e) => {
@@ -231,7 +232,32 @@ class ChatbotApp {
             this.hideLoading();
         }
     }
-
+    
+    async refreshKnowledgeBase() {
+    try {
+        // Update button text to show it's working
+        const refreshBtn = document.getElementById('refreshKbBtn');
+        const originalText = refreshBtn ? refreshBtn.innerHTML : '';
+        if (refreshBtn) {
+            refreshBtn.innerHTML = '🔄 Syncing...';
+            refreshBtn.disabled = true;
+        }
+        
+        // Call loadKnowledgeBase with forceSync = true
+        await this.loadKnowledgeBase(true);
+        
+    } catch (error) {
+        console.error('Refresh failed:', error);
+        this.showNotification('❌ Refresh failed: ' + error.message, 'error');
+    } finally {
+        // Restore button
+        const refreshBtn = document.getElementById('refreshKbBtn');
+        if (refreshBtn) {
+            refreshBtn.innerHTML = '🔄 Refresh';
+            refreshBtn.disabled = false;
+        }
+    }
+}
     async loadKnowledgeBase(forceSync = false) {
     try {
         // If forceSync is true, run sync first
@@ -376,7 +402,7 @@ class ChatbotApp {
     // Re-attach refresh button listener - NOW WITH SYNC
     const refreshBtn = document.getElementById('refreshKbBtn');
     if (refreshBtn) {
-        refreshBtn.addEventListener('click', () => this.loadKnowledgeBase(true)); // Pass true to force sync
+        refreshBtn.addEventListener('click', () => this.refreshKnowledgeBase());
     }
     
     // Re-attach all file detail button listeners
