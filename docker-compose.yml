@@ -7,17 +7,13 @@ services:
     ports:
       - "5000:5000"
     environment:
-      # These should match your .env file
       - QDRANT_URL=${QDRANT_URL}
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     volumes:
-      # Mount local chatbot knowledge base folder into container
-      - C:/Users/maria selciya/Desktop/chatbotKB_test:/app/chatbotKB_test
-      # Mount database file to persist data
       - ./file_index.db:/app/file_index.db
-      # Mount logs directory
       - ./logs:/app/logs
+      - C:/Users/maria selciya/Desktop/chatbotKB_test:/app/chatbotKB_test
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -31,4 +27,3 @@ services:
 networks:
   chatbot-network:
     driver: bridge
-
