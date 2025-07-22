@@ -142,6 +142,7 @@ class KnowledgeBaseSync:
             if COLLECTION_NAME in collection_names:
                 collection_info = self.client.get_collection(COLLECTION_NAME)
                 logger.info(f"Connected to existing collection '{COLLECTION_NAME}' - Points: {collection_info.points_count}")
+                self.ensure_collection_index()
             else:
                 logger.info(f"Creating new collection: {COLLECTION_NAME}")
                 self.client.create_collection(
@@ -149,7 +150,8 @@ class KnowledgeBaseSync:
                     vectors_config=VectorParams(size=768, distance=Distance.COSINE)
                 )
                 logger.info("Collection created successfully!")
-                
+                self.ensure_collection_index()
+
         except Exception as e:
             logger.error(f"Qdrant connection failed: {e}")
             raise
@@ -577,6 +579,29 @@ class KnowledgeBaseSync:
             traceback.print_exc()
             return False
     
+    def ensure_collection_index(self):
+        """Ensure the collection has the required payload index for filename filtering"""
+        try:
+            # Try to create a simple text index for metadata.filename
+            self.client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name="metadata.filename",
+                field_schema="keyword"
+            )
+            logger.info("✅ Created payload index for metadata.filename")
+            return True
+        except Exception as e:
+            error_str = str(e)
+            if any(phrase in error_str.lower() for phrase in ["already exists", "index already exists", "duplicate"]):
+                logger.info("✅ Payload index already exists for metadata.filename")
+                return True
+            else:
+                # For now, just warn but don't fail - the system works without the index
+                logger.warning(f"⚠️ Could not create payload index: {e}")
+                logger.info("📝 System will work without index, but file updates may be slower")
+                return True
+
+
     def cleanup(self):
         """Clean up resources"""
         if self.conn:
